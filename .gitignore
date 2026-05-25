@@ -1,0 +1,14 @@
+# Build results
+[Bb]in/
+[Oo]bj/
+[Pp]ublish/
+
+# User-specific files
+*.csproj.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+# IDE files
+.vs/
+.vscode/
