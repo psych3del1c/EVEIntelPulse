@@ -34,6 +34,10 @@ Everything except names needs to be dragged into chat and selected there.
 3. Download, unpack and run EVEIntelPulse.exe
 
 
+
+
+Made by Arnold Olympus
+
 ===========================================================================
 
 
@@ -66,4 +70,9 @@ EVE IntelPulse — это утилита для Windows, которая позв
 1. Перейдите в раздел [Releases](https://github.com/psych3del1c/EVE-IntelPulse/releases)
 2. Выберите standalone или лёгкую версию (требуется .NET 8 для работы)
 3. Скачайте, распакуйте и запустите `EVEIntelPulse.exe`
+
+
+
+
+Made by Arnold Olympus
 
