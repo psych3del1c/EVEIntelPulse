@@ -34,7 +34,9 @@ Everything except names needs to be dragged into chat and selected there.
 3. Download, unpack and run EVEIntelPulse.exe
 
 
-=============================================================================
+===========================================================================
+
+
 
 
 ## Русская версия
