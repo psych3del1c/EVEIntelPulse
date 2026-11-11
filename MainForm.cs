@@ -24,22 +24,24 @@ namespace EVEIntelPulse
         // ------------------------------------------------------------------
         // Application constants
         // ------------------------------------------------------------------
-        private const string CurrentVersion = "1.0.0";               // Public release version
-        private const string GitHubRepoUrl = "https://github.com/psych3del1c/EVE-IntelPulse";  // TODO: replace before release
-        private const string UpdateCheckUrl = "https://api.github.com/repos/psych3del1c/EVEIntelPulse/releases/latest";
+        private const string CurrentVersion = "1.0.1";               // Public release version
+        private const string GitHubRepoUrl = "https://github.com/psych3del1c/EVE-IntelPulse";
+        private const string UpdateCheckUrl = "https://api.github.com/repos/psych3del1c/EVE-IntelPulse/releases/latest";
         private const string CharacterZkillUrl = "https://zkillboard.com/character/92604044/";
 
         // Default hotkey
         private const string DefaultHotkey = "alt+q";
 
         // Timing values (milliseconds)
-        private const int ClipboardClearDelayMs = 100;
-        private const int SimulateCtrlCDelayMs = 600;
-        private const int ManualModeDelayMs = 200;
-        private const int MaxRetriesClipboard = 3;
-        private const int RetryDelayMs = 150;
+        private const int ManualModeDelayMs = 150;
+        private const int ModifierReleaseTimeoutMs = 1500;           // Max wait for Alt/Ctrl/Shift to be released
+        private const int ClipboardPollIntervalMs = 20;              // Clipboard polling step instead of a fixed sleep
+        private const int ClipboardTimeoutMs = 1200;                 // Max wait for EVE to put the text into the clipboard
+        private const int CopyAttempts = 2;
+        private const int CtrlCStepMs = 15;                          // Pause between Ctrl down, C down, etc.
+        private const int CtrlCHoldMs = 40;                          // How long the C key is held down
         private const int UpdateCheckIntervalHours = 6;
-        private const int EveWindowRestoreDelayMs = 200;
+        private const int EveWindowRestoreDelayMs = 60;
         private const int FooterMarginBottom = 10;                    // Pixels from the window bottom
 
         // ------------------------------------------------------------------
@@ -55,6 +57,7 @@ namespace EVEIntelPulse
 
         private NotifyIcon? trayIcon;
         private Bitmap? trayBitmap;    // Fallback bitmap for tray icon
+        private int processingGuard;   // 0 = idle, 1 = hotkey action in progress
 
         // ------------------------------------------------------------------
         // Constructor
@@ -78,6 +81,7 @@ namespace EVEIntelPulse
             SetupTrayIcon();
             SetupHotkeys();
             UpdateHotkeyLabel();
+            hotkeyEntry!.Text = characterHotkey;
 
             manualCopyCheckBox.Checked = manualCopyMode;
             startMinimizedCheckBox.Checked = startMinimized;
@@ -149,8 +153,19 @@ namespace EVEIntelPulse
         // ------------------------------------------------------------------
         // Event handlers
         // ------------------------------------------------------------------
-        private void HotkeyEntry_Leave(object? sender, EventArgs e) =>
-            characterHotkey = hotkeyEntry!.Text.Trim().ToLower();
+        private void HotkeyEntry_Leave(object? sender, EventArgs e)
+        {
+            string typed = hotkeyEntry!.Text.Trim().ToLower();
+
+            // An empty field must never erase the hotkey: put the current value back.
+            if (string.IsNullOrWhiteSpace(typed))
+            {
+                hotkeyEntry.Text = characterHotkey;
+                return;
+            }
+
+            characterHotkey = typed;
+        }
 
         private void ApplyHotkey_Click(object? sender, EventArgs e) => ApplyCharacterHotkey();
 
@@ -175,11 +190,19 @@ namespace EVEIntelPulse
         {
             if (hotkeyEntry == null) return;
             string newHotkey = hotkeyEntry.Text.Trim().ToLower();
-            if (string.IsNullOrEmpty(newHotkey)) return;
+
+            // Never register an empty hotkey — keep showing the current one instead.
+            if (string.IsNullOrWhiteSpace(newHotkey))
+            {
+                hotkeyEntry.Text = characterHotkey;
+                Logger.Write("[WARN] Empty hotkey ignored");
+                return;
+            }
 
             try
             {
                 characterHotkey = newHotkey;
+                hotkeyEntry.Text = characterHotkey;
                 UpdateHotkeyLabel();
                 SetupHotkeys();
                 SaveConfig();
@@ -219,6 +242,10 @@ namespace EVEIntelPulse
                 characterHotkey = config.TryGetValue("character_hotkey", out var hk) && hk.ValueKind == JsonValueKind.String
                     ? hk.GetString()!
                     : DefaultHotkey;
+
+                // Older builds could save an empty value when the field was cleared.
+                if (string.IsNullOrWhiteSpace(characterHotkey))
+                    characterHotkey = DefaultHotkey;
 
                 manualCopyMode = config.TryGetValue("manual_copy", out var mc) && mc.ValueKind == JsonValueKind.True;
                 startMinimized = config.TryGetValue("start_minimized", out var sm) && sm.ValueKind == JsonValueKind.True;
@@ -351,15 +378,22 @@ namespace EVEIntelPulse
         private void OnHotkeyTriggered()
         {
             Logger.Write("[INFO] Hotkey triggered");
-            BeginInvoke(OpenCharacterLogic);
+            try
+            {
+                // The hook fires from a background thread; marshal to the UI (STA) thread,
+                // because the WinForms Clipboard API requires an STA thread.
+                BeginInvoke(new Action(() => _ = OpenCharacterLogicAsync()));
+            }
+            catch (ObjectDisposedException) { }
+            catch (InvalidOperationException) { }
         }
 
         // ------------------------------------------------------------------
         // Core logic (clipboard + zkillboard)
         // ------------------------------------------------------------------
-        private string TryGetClipboardText()
+        private async Task<string> TryGetClipboardTextAsync(int attempts = 3, int delayMs = 30)
         {
-            for (int i = 0; i < MaxRetriesClipboard; i++)
+            for (int i = 0; i < attempts; i++)
             {
                 try
                 {
@@ -369,65 +403,169 @@ namespace EVEIntelPulse
                 }
                 catch (Exception ex)
                 {
-                    Logger.Write($"[ERROR] Clipboard read attempt {i + 1} failed: {ex.Message}");
+                    Logger.Write($"[WARN] Clipboard read attempt {i + 1}/{attempts} failed: {ex.Message}");
                 }
 
-                if (i < MaxRetriesClipboard - 1)
-                    Thread.Sleep(RetryDelayMs);
+                if (i < attempts - 1)
+                    await Task.Delay(delayMs);
             }
             return "";
         }
 
-        private void OpenCharacterLogic()
+        private static async Task<bool> TryClearClipboardAsync()
         {
-            try
+            for (int i = 0; i < 3; i++)
             {
-                Logger.Write($"[INFO] OpenCharacterLogic start (manual mode = {manualCopyMode})");
-
-                if (!manualCopyMode)
+                try
                 {
-                    IntPtr hwnd = GetActiveEveWindowOrActivate();
-                    if (hwnd == IntPtr.Zero)
-                    {
-                        Logger.Write("[WARN] EVE window not found");
-                        return;
-                    }
+                    Clipboard.Clear();
+                    return true;
+                }
+                catch (Exception ex)
+                {
+                    Logger.Write($"[WARN] Clipboard.Clear attempt {i + 1}/3 failed: {ex.Message}");
+                    await Task.Delay(25);
+                }
+            }
+            return false;
+        }
 
-                    Logger.Write($"[INFO] EVE window found: {hwnd}");
-
+        /// <summary>
+        /// Waits until the clipboard is actually updated by the game instead of
+        /// sleeping for a fixed amount of time. Polling the clipboard sequence number
+        /// makes the hotkey feel instant on both Windows 10 and Windows 11.
+        /// </summary>
+        private static async Task<string> WaitForClipboardTextAsync(uint initialSequence, int timeoutMs)
+        {
+            var sw = Stopwatch.StartNew();
+            while (sw.ElapsedMilliseconds < timeoutMs)
+            {
+                if (GetClipboardSequenceNumber() != initialSequence)
+                {
                     try
                     {
-                        Clipboard.Clear();
-                        Logger.Write("[INFO] Clipboard cleared");
+                        string text = Clipboard.GetText();
+                        if (!string.IsNullOrEmpty(text))
+                        {
+                            Logger.Write($"[INFO] Clipboard updated after {sw.ElapsedMilliseconds} ms");
+                            return text;
+                        }
                     }
                     catch (Exception ex)
                     {
-                        Logger.Write($"[ERROR] Clipboard.Clear failed: {ex.Message}");
-                        try { Clipboard.SetDataObject(""); } catch { }
+                        Logger.Write($"[WARN] Clipboard read after change failed: {ex.Message}");
                     }
+                }
+                await Task.Delay(ClipboardPollIntervalMs);
+            }
+            return "";
+        }
 
-                    Thread.Sleep(ClipboardClearDelayMs);
-                    SimulateCtrlC();
-                    Thread.Sleep(SimulateCtrlCDelayMs);
+        private static async Task<bool> WaitForModifiersReleasedAsync(int timeoutMs)
+        {
+            var sw = Stopwatch.StartNew();
+            while (sw.ElapsedMilliseconds < timeoutMs)
+            {
+                if (!AnyModifierDown())
+                    return true;
+                await Task.Delay(10);
+            }
+            return !AnyModifierDown();
+        }
+
+        private static bool AnyModifierDown() =>
+            IsKeyDown(VK_SHIFT) || IsKeyDown(VK_CONTROL) || IsKeyDown(VK_MENU) ||
+            IsKeyDown(VK_LWIN) || IsKeyDown(VK_RWIN);
+
+        private static bool IsKeyDown(int vk) => (GetAsyncKeyState(vk) & 0x8000) != 0;
+
+        /// <summary>
+        /// Clears the clipboard, sends Ctrl+C to the game and waits for the result.
+        /// The method retries once if the game did not copy anything.
+        /// </summary>
+        private async Task<string> CopySelectionAsync()
+        {
+            for (int attempt = 1; attempt <= CopyAttempts; attempt++)
+            {
+                IntPtr eveWindow = await GetActiveEveWindowOrActivateAsync();
+                if (eveWindow == IntPtr.Zero)
+                {
+                    Logger.Write("[WARN] EVE window not found");
+                    return "";
+                }
+
+                IntPtr foreground = GetForegroundWindow();
+                if (foreground != eveWindow && !IsEveWindow(foreground))
+                {
+                    Logger.Write($"[WARN] EVE is not in the foreground (0x{foreground.ToInt64():X}), not sending Ctrl+C");
+                    return "";
+                }
+
+                if (!await TryClearClipboardAsync())
+                {
+                    Logger.Write("[WARN] Clipboard is locked by another application");
+                    continue;
+                }
+
+                // Crucial for Alt-based hotkeys: if Alt is still physically held, the game
+                // receives Alt+Ctrl+C instead of Ctrl+C and never copies the selection.
+                if (!await WaitForModifiersReleasedAsync(ModifierReleaseTimeoutMs))
+                    Logger.Write("[WARN] Modifiers still held after timeout, sending Ctrl+C anyway");
+
+                // Sample the clipboard state right before injecting keys, so foreign
+                // clipboard updates during the wait above are not mistaken for a copy.
+                uint sequence = GetClipboardSequenceNumber();
+
+                Logger.Write($"[INFO] Copy attempt {attempt}/{CopyAttempts} -> Ctrl+C to '{GetWindowTitle(eveWindow)}'");
+
+                if (!await SendCtrlCAsync())
+                    Logger.Write($"[ERROR] SendInput failed (error {Marshal.GetLastWin32Error()})");
+
+                string text = await WaitForClipboardTextAsync(sequence, ClipboardTimeoutMs);
+                if (!string.IsNullOrEmpty(text))
+                    return text;
+
+                Logger.Write($"[WARN] Clipboard stayed empty for {ClipboardTimeoutMs} ms (attempt {attempt}/{CopyAttempts})");
+            }
+
+            return "";
+        }
+
+        private async Task OpenCharacterLogicAsync()
+        {
+            if (Interlocked.Exchange(ref processingGuard, 1) == 1)
+            {
+                Logger.Write("[INFO] Previous hotkey action is still running, ignoring this press");
+                return;
+            }
+
+            try
+            {
+                var sw = Stopwatch.StartNew();
+                Logger.Write($"[INFO] OpenCharacterLogic start (manual mode = {manualCopyMode})");
+
+                string rawText;
+                if (!manualCopyMode)
+                {
+                    rawText = await CopySelectionAsync();
                 }
                 else
                 {
-                    Logger.Write("[INFO] Manual mode: waiting for pre-copied text");
-                    Thread.Sleep(ManualModeDelayMs);
+                    Logger.Write("[INFO] Manual mode: reading pre-copied text");
+                    await Task.Delay(ManualModeDelayMs);
+                    rawText = await TryGetClipboardTextAsync();
                 }
-
-                string rawText = TryGetClipboardText();
-                Logger.Write($"[INFO] Clipboard returned: '{rawText}'");
 
                 string name = string.IsNullOrEmpty(rawText) ? "" : rawText.Trim().Replace("*", "").Trim();
                 if (name.Length > 90)
                     name = name[..90];
 
-                Logger.Write($"[INFO] Processed name: '{name}'");
+                Logger.Write($"[INFO] Clipboard returned: '{rawText}' -> name: '{name}' ({sw.ElapsedMilliseconds} ms)");
 
                 if (name.Length < 2)
                 {
                     Logger.Write("[WARN] Clipboard empty or too short");
+                    NotifyCopyFailed();
                     return;
                 }
 
@@ -445,24 +583,77 @@ namespace EVEIntelPulse
                     Logger.Write($"[INFO] Not found, search URL: {url}");
                 }
 
-                Logger.Write($"[INFO] Opening browser: {url}");
+                Logger.Write($"[INFO] Opening browser: {url} ({sw.ElapsedMilliseconds} ms)");
                 Process.Start(new ProcessStartInfo(url) { UseShellExecute = true });
             }
             catch (Exception ex)
             {
                 Logger.Write($"[ERROR] OpenCharacterLogic failed: {ex.Message}");
             }
+            finally
+            {
+                Interlocked.Exchange(ref processingGuard, 0);
+            }
+        }
+
+        /// <summary>
+        /// Shows a tray balloon when the selection could not be copied, so the user
+        /// does not have to guess why nothing happened.
+        /// </summary>
+        private void NotifyCopyFailed()
+        {
+            try
+            {
+                if (trayIcon != null && trayIcon.Visible)
+                {
+                    trayIcon.BalloonTipTitle = "EVE IntelPulse";
+                    trayIcon.BalloonTipText = "The selection was not copied. Try again, or enable Manual copy mode. If EVE runs as administrator, run this tool as administrator too.";
+                    trayIcon.ShowBalloonTip(3000);
+                }
+            }
+            catch
+            {
+                // Never let a notification failure break the hotkey flow.
+            }
         }
 
         // ------------------------------------------------------------------
         // EVE window helpers
         // ------------------------------------------------------------------
-        private static IntPtr GetActiveEveWindowOrActivate()
+        /// <summary>
+        /// Returns the EVE window handle, restoring and focusing it if needed.
+        /// Windows 11 is stricter about foreground changes than Windows 10, so we
+        /// verify the result and retry with the AttachThreadInput trick.
+        /// </summary>
+        private static async Task<IntPtr> GetActiveEveWindowOrActivateAsync()
         {
-            IntPtr fg = GetForegroundWindow();
-            if (fg != IntPtr.Zero && IsWindowVisible(fg) && IsEveWindow(fg))
-                return fg;
+            IntPtr foreground = GetForegroundWindow();
+            if (IsEveWindow(foreground))
+                return foreground;
 
+            IntPtr found = FindEveWindow();
+            if (found == IntPtr.Zero)
+                return IntPtr.Zero;
+
+            if (IsIconic(found))
+                ShowWindow(found, SW_RESTORE);
+
+            for (int attempt = 0; attempt < 3; attempt++)
+            {
+                if (ForceForeground(found))
+                {
+                    await Task.Delay(EveWindowRestoreDelayMs);
+                    return found;
+                }
+                await Task.Delay(80);
+            }
+
+            Logger.Write("[WARN] Failed to bring the EVE window to the foreground");
+            return IntPtr.Zero;
+        }
+
+        private static IntPtr FindEveWindow()
+        {
             IntPtr found = IntPtr.Zero;
             EnumWindows((hwnd, _) =>
             {
@@ -473,43 +664,105 @@ namespace EVEIntelPulse
                 }
                 return true;
             }, IntPtr.Zero);
-
-            if (found == IntPtr.Zero)
-                return IntPtr.Zero;
-
-            if (IsIconic(found))
-                ShowWindow(found, SW_RESTORE);
-            SetForegroundWindow(found);
-            Thread.Sleep(EveWindowRestoreDelayMs);
             return found;
+        }
+
+        private static bool ForceForeground(IntPtr hwnd)
+        {
+            if (GetForegroundWindow() == hwnd)
+                return true;
+
+            IntPtr foreground = GetForegroundWindow();
+            uint foregroundThread = foreground != IntPtr.Zero ? GetWindowThreadProcessId(foreground, out _) : 0;
+            uint currentThread = GetCurrentThreadId();
+            bool attached = false;
+
+            try
+            {
+                if (foregroundThread != 0 && foregroundThread != currentThread)
+                    attached = AttachThreadInput(foregroundThread, currentThread, true);
+
+                BringWindowToTop(hwnd);
+                SetForegroundWindow(hwnd);
+            }
+            finally
+            {
+                if (attached)
+                    AttachThreadInput(foregroundThread, currentThread, false);
+            }
+
+            return GetForegroundWindow() == hwnd;
         }
 
         private static bool IsEveWindow(IntPtr hwnd)
         {
-            var sb = new StringBuilder(256);
-            GetWindowText(hwnd, sb, sb.Capacity);
-            string title = sb.ToString().ToLowerInvariant();
-            return title.Contains("eve -") ||
-                   title.Contains("eve online") ||
-                   title.Contains("eve client") ||
-                   title.Contains("- eve") ||
-                   title.Contains("eve -[") ||
-                   title.Contains("eve");
+            if (hwnd == IntPtr.Zero)
+                return false;
+
+            string title = GetWindowTitle(hwnd);
+            if (title.StartsWith("eve -", StringComparison.OrdinalIgnoreCase) ||
+                title.StartsWith("eve online", StringComparison.OrdinalIgnoreCase) ||
+                title.StartsWith("eve client", StringComparison.OrdinalIgnoreCase) ||
+                title.Contains(" - eve", StringComparison.OrdinalIgnoreCase))
+                return true;
+
+            // The EVE client process is called exefile.exe; this also covers
+            // custom window titles.
+            try
+            {
+                GetWindowThreadProcessId(hwnd, out uint pid);
+                if (pid == 0)
+                    return false;
+
+                using var process = Process.GetProcessById((int)pid);
+                return process.ProcessName.Equals("exefile", StringComparison.OrdinalIgnoreCase);
+            }
+            catch
+            {
+                return false;
+            }
         }
 
-        private static void SimulateCtrlC()
+        private static string GetWindowTitle(IntPtr hwnd)
         {
-            const int keyDownFlag = 0x0000;
-            const int keyUpFlag = 0x0002;
-            const int ctrl = 0x11;
-            const int c = 0x43;
-            const int stepMs = 50;
-            const int finalStepMs = 100;
+            var sb = new StringBuilder(256);
+            GetWindowText(hwnd, sb, sb.Capacity);
+            return sb.ToString().Trim();
+        }
 
-            keybd_event(ctrl, 0, keyDownFlag, UIntPtr.Zero); Thread.Sleep(stepMs);
-            keybd_event(c, 0, keyDownFlag, UIntPtr.Zero); Thread.Sleep(stepMs);
-            keybd_event(c, 0, keyUpFlag, UIntPtr.Zero); Thread.Sleep(stepMs);
-            keybd_event(ctrl, 0, keyUpFlag, UIntPtr.Zero); Thread.Sleep(finalStepMs);
+        /// <summary>
+        /// Sends Ctrl+C through SendInput, which is better supported by games than
+        /// the legacy keybd_event API.
+        /// </summary>
+        private static async Task<bool> SendCtrlCAsync()
+        {
+            bool ctrlDown = SendKey(VK_CONTROL, keyUp: false);
+            await Task.Delay(CtrlCStepMs);
+            bool cDown = SendKey(VK_C, keyUp: false);
+            await Task.Delay(CtrlCHoldMs);
+            bool cUp = SendKey(VK_C, keyUp: true);
+            await Task.Delay(CtrlCStepMs);
+            bool ctrlUp = SendKey(VK_CONTROL, keyUp: true);
+            return ctrlDown && cDown && cUp && ctrlUp;
+        }
+
+        private static bool SendKey(int vk, bool keyUp)
+        {
+            var input = new INPUT
+            {
+                type = INPUT_KEYBOARD,
+                U = new InputUnion
+                {
+                    ki = new KEYBDINPUT
+                    {
+                        wVk = (ushort)vk,
+                        wScan = (ushort)MapVirtualKey((uint)vk, MAPVK_VK_TO_VSC),
+                        dwFlags = keyUp ? KEYEVENTF_KEYUP : 0
+                    }
+                }
+            };
+
+            return SendInput(1, new[] { input }, Marshal.SizeOf<INPUT>()) == 1;
         }
 
         // ------------------------------------------------------------------
@@ -683,17 +936,79 @@ namespace EVEIntelPulse
         // ------------------------------------------------------------------
         // WinAPI declarations
         // ------------------------------------------------------------------
-        [DllImport("user32.dll")] private static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern uint SendInput(uint nInputs, INPUT[] pInputs, int cbSize);
+
+        [DllImport("user32.dll")] private static extern short GetAsyncKeyState(int vKey);
+        [DllImport("user32.dll")] private static extern uint GetClipboardSequenceNumber();
         [DllImport("user32.dll")] private static extern IntPtr GetForegroundWindow();
         [DllImport("user32.dll")] private static extern int GetWindowText(IntPtr hWnd, StringBuilder lpString, int nMaxCount);
         [DllImport("user32.dll")] private static extern bool IsWindowVisible(IntPtr hWnd);
         [DllImport("user32.dll")] private static extern bool IsIconic(IntPtr hWnd);
         [DllImport("user32.dll")] private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
         [DllImport("user32.dll")] private static extern bool SetForegroundWindow(IntPtr hWnd);
+        [DllImport("user32.dll")] private static extern bool BringWindowToTop(IntPtr hWnd);
+        [DllImport("user32.dll")] private static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool fAttach);
+        [DllImport("user32.dll")] private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
         [DllImport("user32.dll")] private static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+        [DllImport("user32.dll")] private static extern uint MapVirtualKey(uint uCode, uint uMapType);
+        [DllImport("kernel32.dll")] private static extern uint GetCurrentThreadId();
 
         private delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
 
+        [StructLayout(LayoutKind.Sequential)]
+        private struct INPUT
+        {
+            public uint type;
+            public InputUnion U;
+        }
+
+        [StructLayout(LayoutKind.Explicit)]
+        private struct InputUnion
+        {
+            [FieldOffset(0)] public MOUSEINPUT mi;
+            [FieldOffset(0)] public KEYBDINPUT ki;
+            [FieldOffset(0)] public HARDWAREINPUT hi;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct MOUSEINPUT
+        {
+            public int dx;
+            public int dy;
+            public uint mouseData;
+            public uint dwFlags;
+            public uint time;
+            public IntPtr dwExtraInfo;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct KEYBDINPUT
+        {
+            public ushort wVk;
+            public ushort wScan;
+            public uint dwFlags;
+            public uint time;
+            public IntPtr dwExtraInfo;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct HARDWAREINPUT
+        {
+            public uint uMsg;
+            public ushort wParamL;
+            public ushort wParamH;
+        }
+
         private const int SW_RESTORE = 9;
+        private const uint INPUT_KEYBOARD = 1;
+        private const uint KEYEVENTF_KEYUP = 0x0002;
+        private const uint MAPVK_VK_TO_VSC = 0;
+        private const int VK_SHIFT = 0x10;
+        private const int VK_CONTROL = 0x11;
+        private const int VK_MENU = 0x12;
+        private const int VK_LWIN = 0x5B;
+        private const int VK_RWIN = 0x5C;
+        private const int VK_C = 0x43;
     }
 }
