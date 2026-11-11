@@ -6,6 +6,7 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Net.Http;
@@ -58,6 +59,8 @@ namespace EVEIntelPulse
         private NotifyIcon? trayIcon;
         private Bitmap? trayBitmap;    // Fallback bitmap for tray icon
         private int processingGuard;   // 0 = idle, 1 = hotkey action in progress
+        private bool updateAvailable;
+        private System.Windows.Forms.Timer? updateTimer;
 
         // ------------------------------------------------------------------
         // Constructor
@@ -98,8 +101,12 @@ namespace EVEIntelPulse
                 footerLayout.Location = new Point(footerX, footerY);
             };
 
-            // Start asynchronous update check
+            // Start asynchronous update check and repeat it while the app keeps running,
+            // so long sessions also learn about new releases.
             Task.Run(CheckForUpdatesAsync);
+            updateTimer = new System.Windows.Forms.Timer { Interval = UpdateCheckIntervalHours * 60 * 60 * 1000 };
+            updateTimer.Tick += (_, _) => Task.Run(CheckForUpdatesAsync);
+            updateTimer.Start();
 
             Logger.Write("[INFO] Initialization complete");
         }
@@ -783,6 +790,7 @@ namespace EVEIntelPulse
                 Visible = false
             };
             trayIcon.DoubleClick += (_, _) => ShowFromTray();
+            trayIcon.BalloonTipClicked += (_, _) => OpenUpdateUrl();
             Logger.Write("[INFO] Tray icon initialized");
         }
 
@@ -819,7 +827,8 @@ namespace EVEIntelPulse
 
         private void ShowFromTray()
         {
-            if (trayIcon != null) trayIcon.Visible = false;
+            // Keep the icon while an update hint is pending, otherwise the balloon link is lost.
+            if (trayIcon != null && !updateAvailable) trayIcon.Visible = false;
             Show();
             WindowState = FormWindowState.Normal;
             Activate();
@@ -829,6 +838,8 @@ namespace EVEIntelPulse
         protected override void OnFormClosing(FormClosingEventArgs e)
         {
             Logger.Write("[INFO] Application closing");
+            updateTimer?.Stop();
+            updateTimer?.Dispose();
             trayIcon?.Dispose();
             trayBitmap?.Dispose();
             KeyboardHook.UnhookAll();
@@ -842,15 +853,17 @@ namespace EVEIntelPulse
         {
             try
             {
-                // Respect check interval
+                // Respect check interval (the timestamp is written in UTC with a trailing "Z";
+                // parse it as UTC, otherwise the interval is shifted by the time zone offset).
                 if (File.Exists(configFile))
                 {
                     var config = JsonSerializer.Deserialize<Dictionary<string, JsonElement>>(File.ReadAllText(configFile));
                     if (config != null && config.TryGetValue("last_update_check", out var lastCheckElement))
                     {
                         string? lastCheckStr = lastCheckElement.GetString();
-                        if (DateTime.TryParse(lastCheckStr, out DateTime lastCheck) &&
-                            (DateTime.UtcNow - lastCheck).TotalHours < UpdateCheckIntervalHours)
+                        if (DateTimeOffset.TryParse(lastCheckStr, CultureInfo.InvariantCulture,
+                                DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal, out DateTimeOffset lastCheck) &&
+                            (DateTimeOffset.UtcNow - lastCheck).TotalHours < UpdateCheckIntervalHours)
                             return;
                     }
                 }
@@ -864,22 +877,15 @@ namespace EVEIntelPulse
 
                 SaveLastUpdateCheck();
 
-                if (latestTag != null && latestTag != $"v{CurrentVersion}")
+                if (IsNewerVersion(latestTag))
                 {
-                    BeginInvoke(new Action(() =>
-                    {
-                        versionLabel.Text = $"Update available: {latestTag}";
-                        versionLabel.LinkColor = Color.FromArgb(100, 149, 237);
-                        versionLabel.ActiveLinkColor = Color.FromArgb(100, 149, 237);
-                        versionLabel.VisitedLinkColor = Color.FromArgb(100, 149, 237);
-                        versionLabel.LinkBehavior = LinkBehavior.HoverUnderline;
-                        versionLabel.Tag = htmlUrl;
-                    }));
-                    Logger.Write($"[INFO] Update available: {latestTag}");
+                    BeginInvoke(new Action(() => ShowUpdateNotification(latestTag!, htmlUrl)));
+                    Logger.Write($"[INFO] Update available: {latestTag} (current {CurrentVersion})");
                 }
                 else
                 {
                     BeginInvoke(new Action(() => { versionLabel.Text = $"v{CurrentVersion} — Latest"; }));
+                    Logger.Write($"[INFO] No updates: latest release is {latestTag}, current {CurrentVersion}");
                 }
             }
             catch (Exception ex)
@@ -887,6 +893,59 @@ namespace EVEIntelPulse
                 Logger.Write($"[WARN] Update check failed: {ex.Message}");
                 BeginInvoke(new Action(() => { versionLabel.Text = $"v{CurrentVersion}"; }));
             }
+        }
+
+        /// <summary>
+        /// Compares the release tag with the running version, so an older release
+        /// never produces a bogus "update available" hint.
+        /// </summary>
+        private static bool IsNewerVersion(string? latestTag)
+        {
+            if (string.IsNullOrWhiteSpace(latestTag))
+                return false;
+
+            string trimmed = latestTag.Trim().TrimStart('v', 'V');
+            if (Version.TryParse(trimmed, out var latest) && Version.TryParse(CurrentVersion, out var current))
+                return latest > current;
+
+            return !string.Equals(latestTag, $"v{CurrentVersion}", StringComparison.OrdinalIgnoreCase);
+        }
+
+        /// <summary>
+        /// Makes the new release visible: blue link in the footer plus a tray balloon,
+        /// because the tiny footer label alone is easy to miss.
+        /// </summary>
+        private void ShowUpdateNotification(string latestTag, string? htmlUrl)
+        {
+            updateAvailable = true;
+
+            versionLabel.Text = $"Update available: {latestTag}";
+            versionLabel.LinkColor = Color.FromArgb(100, 149, 237);
+            versionLabel.ActiveLinkColor = Color.FromArgb(100, 149, 237);
+            versionLabel.VisitedLinkColor = Color.FromArgb(100, 149, 237);
+            versionLabel.LinkBehavior = LinkBehavior.HoverUnderline;
+            versionLabel.Tag = htmlUrl;
+
+            try
+            {
+                if (trayIcon != null)
+                {
+                    trayIcon.BalloonTipTitle = "EVE IntelPulse update available";
+                    trayIcon.BalloonTipText = $"{latestTag} is ready. Click to open the release page.";
+                    trayIcon.Visible = true;
+                    trayIcon.ShowBalloonTip(10000);
+                }
+            }
+            catch
+            {
+                // A failed balloon must not break the update flow.
+            }
+        }
+
+        private void OpenUpdateUrl()
+        {
+            if (versionLabel.Tag is string url && !string.IsNullOrEmpty(url))
+                Process.Start(new ProcessStartInfo(url) { UseShellExecute = true });
         }
 
         private void SaveLastUpdateCheck()

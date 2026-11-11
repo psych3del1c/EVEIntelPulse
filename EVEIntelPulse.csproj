@@ -17,4 +17,11 @@
     <EmbeddedResource Include="eye_icon.ico" />
     <EmbeddedResource Include="eve_universe.json" />
   </ItemGroup>
+
+  <ItemGroup>
+    <!-- The manual-upload folder mirrors the repository contents; exclude it from the build. -->
+    <Compile Remove="for-github/**" />
+    <EmbeddedResource Remove="for-github/**" />
+    <None Remove="for-github/**" />
+  </ItemGroup>
 </Project>
