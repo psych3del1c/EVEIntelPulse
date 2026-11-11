@@ -27,14 +27,6 @@ Everything except names needs to be dragged into chat and selected there.
 
 **Manual copy mode** is recommended if you use clipboard managers or encounter issues with automatic copying.
 
-## Troubleshooting
-
-- The hotkey is triggered **after** the keys are released, so the game receives a clean `Ctrl+C` instead of `Alt+Ctrl+C`.
-- If automatic copying still fails, check `%APPDATA%\EVE_IntelPulse\app.log` — it records the foreground window, the copy attempts and the clipboard timings.
-- If the EVE client runs as administrator, run EVE IntelPulse as administrator too: Windows blocks simulated input from a lower-privileged process.
-- Alternatively enable **Manual copy mode**: select the text, press `Ctrl+C` yourself, then press the hotkey.
-- Only one instance can run at a time: a second copy would install the same global hotkey and open a second browser tab for every press, so it shows a message and exits.
-
 ## Installation
 
 1. Go to the [Releases](https://github.com/psych3del1c/EVE-IntelPulse/releases)
@@ -72,14 +64,6 @@ EVE IntelPulse — это утилита для Windows, которая позв
 5. Страница zKillboard откроется в браузере по умолчанию
 
 Ручной режим рекомендуется, если вы используете менеджеры буфера обмена или испытываете проблемы с автоматическим копированием.
-
-## Решение проблем
-
-- Хоткей срабатывает **после отпускания** клавиш, поэтому в игру уходит чистый `Ctrl+C`, а не `Alt+Ctrl+C`.
-- Если автоматическое копирование всё равно не работает, посмотрите `%APPDATA%\EVE_IntelPulse\app.log` — там пишется активное окно, попытки копирования и время ожидания буфера.
-- Если клиент EVE запущен от администратора, запустите EVE IntelPulse тоже от администратора: Windows блокирует эмуляцию ввода из процесса с меньшими правами.
-- Либо включите **ручной режим**: выделите текст, нажмите `Ctrl+C` сами, затем нажмите хоткей.
-- Одновременно может работать только один экземпляр: вторая копия повесила бы тот же глобальный хоткей и открывала бы вторую вкладку на каждое нажатие, поэтому она показывает сообщение и закрывается.
 
 ## Установка
 
